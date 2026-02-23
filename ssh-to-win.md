@@ -1,146 +1,126 @@
-## SSH to Win11（给 Agent 的避坑技能）
+### 给 LLM Agent 的 Win11 SSH 避坑速查（已实战踩过）
 
-目标：让 **Termux/WSL/Linux → Windows 11** 的 SSH 登录稳定可用，尤其是 **公钥免密** 场景（常见：走 Tailscale）。
-
-这份文档写给“会执行命令的 Agent”，核心是避免 Windows OpenSSH 的 Win-only 坑。
+**场景**：Termux（或任意 Linux 客户端）用 Ed25519 公钥登录一台 Win11，本地账号是本机管理员（`Administrators` 组），SSH 由 Windows OpenSSH 提供。
 
 ---
 
-### 0. 先记住最关键结论（90% 卡在这里）
+### 1. 最大坑：管理员账号不看用户目录的 `authorized_keys`
 
-如果你用的是 **管理员账号**（属于 `Administrators` 组）登录 Windows：
+- 对 **管理员账号**，Win OpenSSH 默认配置是：
 
-- **不要只写** `C:\Users\<user>\.ssh\authorized_keys`
-- Windows OpenSSH 默认真正看的往往是：
-  - `C:\ProgramData\ssh\administrators_authorized_keys`
-  - 且必须有严格 ACL（只允许 Administrators + SYSTEM）
+  ```text
+  Match Group administrators
+      AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+  ```
 
-否则客户端会无限看到：
+- 这意味着：
+  - `C:\Users\<user>\.ssh\authorized_keys` **不会被用来认证管理员登录**
+  - 你往用户目录写再多 key，都会得到：
+    - `Permission denied (publickey,password,keyboard-interactive).`
+    - 然后继续要密码
 
-```text
-Permission denied (publickey,password,keyboard-interactive).
-```
-
----
-
-### 1. Windows 端：确保 sshd 正在跑
-
-在 Windows PowerShell：
-
-```powershell
-Get-Service sshd
-```
-
-如果没有 `sshd`，先安装 OpenSSH Server（略）。
-
----
-
-### 2. 客户端（Termux）端：准备密钥 + 只测公钥（禁用密码回退）
-
-Termux：
-
-```bash
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
-chmod 600 ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub 2>/dev/null || true
-
-# 强制：只允许公钥，禁止密码回退，避免“其实用密码登上了还以为 key OK”
-ssh -i ~/.ssh/id_ed25519 \
-  -o PubkeyAuthentication=yes \
-  -o PasswordAuthentication=no \
-  y9_win11@100.72.70.79 "echo WIN_OK && hostname"
-```
-
----
-
-### 3. Windows 端：写入用户 authorized_keys（普通用户用这个）
-
-```powershell
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.ssh" | Out-Null
-# 注意：authorized_keys 文件里只能是一行行的 ssh-ed25519/ssh-rsa 公钥，别把 PowerShell 的 @" / "@ 写进去
-@"
-ssh-ed25519 AAAA... your-comment
-"@ | Set-Content -Path "$env:USERPROFILE\.ssh\authorized_keys"
-```
-
-快速验收：
-
-```powershell
-type "$env:USERPROFILE\.ssh\authorized_keys"
-```
-
----
-
-### 4. Win-only 关键：管理员账号必须配置 administrators_authorized_keys
-
-先确认用户是否是管理员：
+**Agent 必须首先判断：**
 
 ```powershell
 net localgroup administrators
 ```
 
-如果目标登录用户在列表里，就按下面做（**需要管理员 PowerShell / UAC**，Agent 不能替用户点 UAC）。
+如果目标账号在列表里，就要走 **ProgramData 那条路**，而不是只改用户目录。
 
-在 **PowerShell（管理员）** 粘贴：
+---
+
+### 2. 正确的管理员公钥文件与权限
+
+**目标文件**：`C:\ProgramData\ssh\administrators_authorized_keys`
+
+**要求：**
+
+1. 内容：**只有纯粹的公钥行**，例如：
+
+   ```text
+   ssh-ed25519 AAAA... u0_a383@localhost
+   ```
+
+   - 不要带 PowerShell here-string 的 `@"` / `"@`
+   - 不要带多余注释行（除非你确定不会破坏格式）
+
+2. ACL 必须非常严格，否则 OpenSSH 会直接忽略该文件：
+
+   ```powershell
+   icacls "C:\ProgramData\ssh\administrators_authorized_keys" `
+     /inheritance:r `
+     /grant "*S-1-5-32-544:F" `
+     /grant "SYSTEM:F"
+   ```
+
+   - `*S-1-5-32-544` 是 `Administrators` 组的 SID，避免本地化名字差异
+   - 只有 `Administrators` + `SYSTEM` 拥有权限
+
+---
+
+### 3. Agent 在 Win11 上应该怎么干（管理员账号场景）
+
+**前提**：公钥已经写进了用户目录的 `authorized_keys`（例如你之前用脚本加进去）。
+
+**在提升权限的 PowerShell 中（必须 Admin）执行一条多行命令：**
 
 ```powershell
 $authorizedKey = Get-Content -Path "$env:USERPROFILE\.ssh\authorized_keys"
 New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
 Set-Content -Force -Path "$env:ProgramData\ssh\administrators_authorized_keys" -Value $authorizedKey
-
-# 用 SID 避免系统语言导致的组名不匹配：
-# S-1-5-32-544 = Administrators
 icacls "$env:ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant "*S-1-5-32-544:F" /grant "SYSTEM:F"
-
 Restart-Service sshd
 ```
 
-要点：
-- **UAC**：这一步基本必须用户手动开“管理员 PowerShell”执行一次。
-- **ACL**：不正确就当没配置，继续 Permission denied。
+**对 LLM Agent 的要点：**
+
+- 你可以生成上面这段命令，但**无法替用户点击 UAC**，所以要明确提示：
+  - “请在 *管理员* PowerShell 里执行这整段”
+- 执行后再自动检查一次：
+
+  ```powershell
+  type C:\ProgramData\ssh\administrators_authorized_keys
+  icacls C:\ProgramData\ssh\administrators_authorized_keys
+  ```
+
+  确认文件存在且 ACL 正确。
 
 ---
 
-### 5. 最终验收（回到 Termux）
+### 4. Termux / Linux 侧的常规事项（相对简单）
 
-还是用“禁用密码回退”的命令：
+- 权限：
 
-```bash
-ssh -i ~/.ssh/id_ed25519 \
-  -o PubkeyAuthentication=yes \
-  -o PasswordAuthentication=no \
-  y9_win11@100.72.70.79 "echo WIN_OK && hostname"
-```
+  ```bash
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  chmod 600 ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub 2>/dev/null || true
+  ```
 
-看到 `WIN_OK` 即通过。
+- 测试纯公钥登录（必须禁止密码回退，否则会误判）：
 
----
+  ```bash
+  ssh -i ~/.ssh/id_ed25519 \
+      -o PubkeyAuthentication=yes \
+      -o PasswordAuthentication=no \
+      y9_win11@100.72.70.79 "echo WIN_OK && hostname"
+  ```
 
-### 6. 体验优化：Termux 里加别名 host
+- 通过后再写 `~/.ssh/config`：
 
-```bash
-cat >> ~/.ssh/config <<EOF
-
-Host win11
-  HostName 100.72.70.79
-  User y9_win11
-  IdentityFile ~/.ssh/id_ed25519
-EOF
-
-chmod 600 ~/.ssh/config
-```
-
-以后直接：
-
-```bash
-ssh win11
-```
+  ```bash
+  Host win11
+      HostName 100.72.70.79
+      User y9_win11
+      IdentityFile ~/.ssh/id_ed25519
+  ```
 
 ---
 
-### 7. 给 Agent 的“别踩坑清单”
+### 5. 总结给 Agent 的“一句话原则”
 
-- 管理员账号：优先检查 `C:\ProgramData\ssh\administrators_authorized_keys`
-- 不要把 `@"` / `"@` 这类 shell 语法写进 `authorized_keys`
-- 任何“写 ProgramData + 改 ACL”都要 UAC：Agent 只能提示用户手动执行
-- 验收必须禁用密码回退：`-o PasswordAuthentication=no`
-
+- **如果目标是 Windows 管理员账号**：
+  - **永远不要只改用户目录的 `authorized_keys`**
+  - 必须改 `C:\ProgramData\ssh\administrators_authorized_keys`，并设置严格 ACL
+  - 所有对该文件的操作，都需要通过“用户确认 UAC 的管理员 PowerShell”来完成  
+- 否则，你会一直看到 `Permission denied (publickey,...)`，然后回退到密码登录，看起来像“key 完全没生效”。
