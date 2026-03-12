@@ -40,8 +40,7 @@ net localgroup administrators
    ```text
    ssh-ed25519 AAAA... u0_a383@localhost
    ```
-
-   - 不要带 PowerShell here-string 的 `@"` / `"@`
+   
    - 不要带多余注释行（除非你确定不会破坏格式）
 
 2. ACL 必须非常严格，否则 OpenSSH 会直接忽略该文件：
